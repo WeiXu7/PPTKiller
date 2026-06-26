@@ -1,0 +1,15 @@
+.DS_Store
+.env
+**/.env
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+backend/data/
+backend/generated/
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+frontend/.npmrc
+**/node_modules/
+backend/generated/
