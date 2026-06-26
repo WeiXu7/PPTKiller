@@ -52,6 +52,11 @@ export const api = {
     request(`/sessions/${sessionId}/approve`, { method: "POST", body: JSON.stringify(payload) }),
   revise: (sessionId, instruction) =>
     request(`/sessions/${sessionId}/revise`, { method: "POST", body: JSON.stringify({ instruction }) }),
+  updateSlide: (sessionId, number, payload) =>
+    request(`/sessions/${sessionId}/slides/${number}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  updateSlideImage: (sessionId, number, payload) =>
+    request(`/sessions/${sessionId}/slides/${number}/image`, { method: "PATCH", body: JSON.stringify(payload) }),
+  searchImages: (query, limit = 8) => request(`/research/images?q=${encodeURIComponent(query)}&limit=${limit}`),
   exportManifest: (sessionId) => request(`/sessions/${sessionId}/export/manifest`),
   upload: async (projectId, file, description = "") => {
     const form = new FormData();

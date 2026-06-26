@@ -1,4 +1,6 @@
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -12,7 +14,7 @@ from .dependencies import get_current_user
 from .models import AgentSession, Project, ProjectAsset, User
 from .schemas import (
     ApprovalRequest, AssetRead, AuthResponse, LoginRequest, ProjectCreate, ProjectRead,
-    ExportArtifactRead, RevisionRequest, SessionRead, SessionStart, UserCreate, UserRead,
+    ExportArtifactRead, RevisionRequest, SessionRead, SessionStart, SlideImageRequest, SlideUpdateRequest, UserCreate, UserRead,
 )
 from .security import create_access_token, hash_password, verify_password
 from .services.harness import AgentHarness
@@ -39,6 +41,137 @@ def owned_session(db: Session, user: User, session_id: str) -> tuple[AgentSessio
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
     return session, session.project
+
+
+def apply_slide_update(session: AgentSession, slide_number: int, payload: SlideUpdateRequest) -> AgentSession:
+    artifacts = dict(session.artifacts or {})
+    outline = dict(artifacts.get("outline") or {})
+    slides = [dict(slide) for slide in outline.get("slides") or []]
+    if not slides:
+        raise HTTPException(status_code=409, detail="当前会话还没有可编辑的大纲")
+    if slide_number < 1 or slide_number > len(slides):
+        raise HTTPException(status_code=404, detail="幻灯片不存在")
+
+    clean_bullets = [item.strip() for item in payload.bullets if item.strip()]
+    index = slide_number - 1
+    updated = {
+        **slides[index],
+        "number": slide_number,
+        "title": payload.title.strip(),
+        "layout": payload.layout,
+        "bullets": clean_bullets,
+        "key_message": payload.key_message.strip(),
+        "speaker_notes": payload.speaker_notes.strip(),
+    }
+    if payload.layout in {"data", "case"}:
+        updated["type"] = payload.layout
+    elif payload.layout == "summary":
+        updated["type"] = "summary"
+    elif payload.layout == "cover":
+        updated["type"] = "cover"
+    else:
+        updated["type"] = "content"
+
+    slides[index] = updated
+    outline["slides"] = slides
+    outline["target_count"] = len(slides)
+    outline["note"] = f"已保存第 {slide_number} 页编辑。"
+    artifacts["outline"] = outline
+
+    generated = dict(artifacts.get("slides") or {})
+    if generated:
+        generated["generated"] = len(slides)
+        generated["slides"] = slides
+        generated["editable"] = True
+        generated["note"] = f"已同步 {len(slides)} 页可编辑幻灯片数据。"
+        artifacts["slides"] = generated
+
+    notes = dict(artifacts.get("notes") or {})
+    if notes:
+        enabled = bool(notes.get("enabled", True))
+        items = [
+            {"number": slide.get("number", item_index + 1), "text": slide.get("speaker_notes", "")}
+            for item_index, slide in enumerate(slides)
+            if enabled and slide.get("speaker_notes")
+        ]
+        notes["items"] = items
+        notes["coverage"] = len(items) if enabled else 0
+        notes["note"] = f"已同步 {len(items)} 页演讲稿。" if enabled else "用户选择跳过演讲稿。"
+        artifacts["notes"] = notes
+
+    artifacts["_export_revision"] = datetime.now(timezone.utc).isoformat()
+    session.artifacts = artifacts
+    return session
+
+
+def _replace_slide(session: AgentSession, slide_number: int, updater) -> AgentSession:
+    artifacts = dict(session.artifacts or {})
+    outline = dict(artifacts.get("outline") or {})
+    slides = [dict(slide) for slide in outline.get("slides") or []]
+    if not slides:
+        raise HTTPException(status_code=409, detail="当前会话还没有可编辑的大纲")
+    if slide_number < 1 or slide_number > len(slides):
+        raise HTTPException(status_code=404, detail="幻灯片不存在")
+
+    index = slide_number - 1
+    slides[index] = updater(slides[index])
+    outline["slides"] = slides
+    outline["target_count"] = len(slides)
+    artifacts["outline"] = outline
+
+    generated = dict(artifacts.get("slides") or {})
+    if generated:
+        generated["generated"] = len(slides)
+        generated["slides"] = slides
+        generated["editable"] = True
+        artifacts["slides"] = generated
+
+    artifacts["_export_revision"] = datetime.now(timezone.utc).isoformat()
+    session.artifacts = artifacts
+    return session
+
+
+def apply_slide_image_assignment(session: AgentSession, slide_number: int, assignment: dict) -> AgentSession:
+    mode = assignment.get("mode", "auto")
+    if mode not in {"auto", "none", "search", "upload"}:
+        raise HTTPException(status_code=422, detail="图片模式不支持")
+
+    clean = {"mode": mode}
+    if mode == "search":
+        image = assignment.get("image") or assignment
+        parsed_image_url = urlparse(image.get("url", ""))
+        parsed_source_url = urlparse(image.get("source_url", ""))
+        if parsed_image_url.scheme != "https" or not parsed_image_url.netloc.endswith("images.unsplash.com"):
+            raise HTTPException(status_code=422, detail="请选择来自图片检索结果的图片")
+        if parsed_source_url.netloc and not parsed_source_url.netloc.endswith("unsplash.com"):
+            raise HTTPException(status_code=422, detail="图片来源链接不受支持")
+        clean.update({
+            "query": (assignment.get("query") or "").strip(),
+            "url": image.get("url", ""),
+            "thumb": image.get("thumb", ""),
+            "description": image.get("description", ""),
+            "author": image.get("author", ""),
+            "source_url": image.get("source_url", ""),
+        })
+        if not clean["url"]:
+            raise HTTPException(status_code=422, detail="请选择一张检索图片")
+    elif mode == "upload":
+        clean.update({
+            "asset_id": assignment.get("asset_id", ""),
+            "filename": assignment.get("filename", ""),
+            "path": assignment.get("path", ""),
+            "content_type": assignment.get("content_type", "application/octet-stream"),
+            "author": assignment.get("author", "用户上传"),
+        })
+        if not clean["asset_id"] or not clean["path"]:
+            raise HTTPException(status_code=422, detail="请选择一张上传图片")
+
+    def updater(slide: dict) -> dict:
+        updated = dict(slide)
+        updated["image_assignment"] = clean
+        return updated
+
+    return _replace_slide(session, slide_number, updater)
 
 
 @router.post("/auth/register", response_model=AuthResponse, status_code=201)
@@ -173,6 +306,43 @@ async def revise_session(
 ):
     session, project = owned_session(db, user, session_id)
     return await AgentHarness(db).revise(session, project, payload.instruction)
+
+
+@router.patch("/sessions/{session_id}/slides/{slide_number}", response_model=SessionRead)
+def update_session_slide(
+    session_id: str, slide_number: int, payload: SlideUpdateRequest,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    session, _ = owned_session(db, user, session_id)
+    apply_slide_update(session, slide_number, payload)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+@router.patch("/sessions/{session_id}/slides/{slide_number}/image", response_model=SessionRead)
+def update_session_slide_image(
+    session_id: str, slide_number: int, payload: SlideImageRequest,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    session, project = owned_session(db, user, session_id)
+    assignment = payload.model_dump()
+    if payload.mode == "upload":
+        asset = db.scalar(
+            select(ProjectAsset).where(ProjectAsset.id == payload.asset_id, ProjectAsset.project_id == project.id)
+        )
+        if not asset or not asset.content_type.startswith("image/"):
+            raise HTTPException(status_code=404, detail="上传图片不存在")
+        assignment.update({
+            "filename": asset.filename,
+            "path": asset.path,
+            "content_type": asset.content_type,
+            "author": "用户上传",
+        })
+    apply_slide_image_assignment(session, slide_number, assignment)
+    db.commit()
+    db.refresh(session)
+    return session
 
 
 @router.get("/sessions/{session_id}/export")

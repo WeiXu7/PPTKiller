@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +228,7 @@ class AssetParser:
                 values = [self._cell_value(value) for value in list(row)[:MAX_COLS_PER_SHEET]]
                 if any(value != "" for value in values):
                     rows.append(values)
-            tables.append({"sheet": name, "rows": rows})
+            tables.append({"sheet": name, "rows": rows, "data_profile": self._table_profile(name, rows)})
             preview = "\n".join(" | ".join(row) for row in rows[:60])
             sections.append({
                 "kind": "sheet",
@@ -258,7 +259,7 @@ class AssetParser:
             "parser": "csv",
             "text": preview[:MAX_TEXT_CHARS],
             "sections": [{"kind": "sheet", "label": path.name, "text": preview[:10000]}],
-            "tables": [{"sheet": path.stem, "rows": rows}],
+            "tables": [{"sheet": path.stem, "rows": rows, "data_profile": self._table_profile(path.stem, rows)}],
             "stats": {"rows": len(rows), "columns": max((len(row) for row in rows), default=0)},
         }
 
@@ -283,3 +284,68 @@ class AssetParser:
         if value is None:
             return ""
         return str(value)[:1000]
+
+    def _table_profile(self, name: str, rows: list[list[str]]) -> dict:
+        if len(rows) < 2:
+            return {"chart_type": "table", "series": [], "kpis": [], "source": name}
+        headers = [header.strip() or f"列 {index + 1}" for index, header in enumerate(rows[0])]
+        body = rows[1:21]
+        category_hint_index = next(
+            (index for index, header in enumerate(headers) if any(token in header.lower() for token in ["年", "月", "日", "时间", "date", "year"])),
+            None,
+        )
+        numeric_columns = []
+        for col_index, header in enumerate(headers):
+            if col_index == category_hint_index:
+                continue
+            values = [self._number(row[col_index] if col_index < len(row) else "") for row in body]
+            numeric_values = [value for value in values if value is not None]
+            if numeric_values:
+                numeric_columns.append((col_index, header, numeric_values))
+        if not numeric_columns:
+            return {"chart_type": "table", "headers": headers, "preview_rows": body[:8], "series": [], "kpis": [], "source": name}
+
+        numeric_indexes = {col_index for col_index, _, _ in numeric_columns}
+        category_index = category_hint_index if category_hint_index is not None else next((index for index in range(len(headers)) if index not in numeric_indexes), 0)
+        category_column = headers[category_index]
+        series = []
+        for col_index, header, _ in numeric_columns[:3]:
+            points = []
+            for row_index, row in enumerate(body):
+                value = self._number(row[col_index] if col_index < len(row) else "")
+                if value is None:
+                    continue
+                label = row[category_index] if category_index < len(row) and row[category_index] else str(row_index + 1)
+                points.append({"label": str(label), "value": value})
+            if points:
+                series.append({"name": header, "points": points[:12]})
+
+        first_series = series[0]["points"] if series else []
+        kpis = [
+            {"label": header, "value": values[-1], "source": name}
+            for _, header, values in numeric_columns[:4]
+        ]
+        chart_type = "line" if len(first_series) >= 3 and any(token in category_column for token in ["年", "月", "日", "时间", "date", "year"]) else "bar"
+        return {
+            "chart_type": chart_type,
+            "category_column": category_column,
+            "value_columns": [header for _, header, _ in numeric_columns[:3]],
+            "series": series,
+            "kpis": kpis,
+            "headers": headers,
+            "preview_rows": body[:8],
+            "source": name,
+        }
+
+    @staticmethod
+    def _number(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, int | float):
+            return float(value)
+        text = str(value).strip().replace(",", "")
+        if text.endswith("%"):
+            text = text[:-1]
+        if not re.fullmatch(r"-?\d+(\.\d+)?", text):
+            return None
+        return float(text)
