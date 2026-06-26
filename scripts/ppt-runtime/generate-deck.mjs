@@ -14,16 +14,17 @@ await fs.mkdir(qaDir, { recursive: true });
 const deck = Presentation.create({ slideSize: { width: 1280, height: 720 } });
 const C = {
   ink: "#111936",
-  navy: "#18256F",
-  violet: "#5442D6",
-  pale: "#F1F2F8",
-  panel: "#F7F8FB",
+  navy: "#14245A",
+  violet: "#5B4BE7",
+  pale: "#F4F6FB",
+  panel: "#F8FAFD",
   muted: "#687086",
-  line: "#D9DDE8",
+  line: "#E3E7F0",
   green: "#218B4B",
+  amber: "#C47A1B",
   white: "#FFFFFF",
 };
-const FONT = "Arial";
+const FONT = "Heiti SC";
 const PAGE = { left: 68, top: 46, width: 1144, height: 624 };
 
 function addText(slide, text, position, style = {}, name = undefined) {
@@ -59,16 +60,16 @@ function addRule(slide, left, top, width, fill = C.line, height = 1) {
 }
 
 function addHeader(slide, slideData, index) {
-  addText(slide, String(index + 1).padStart(2, "0"), { left: PAGE.left, top: 30, width: 70, height: 24 }, { fontSize: 14, bold: true, color: C.violet });
-  addText(slide, data.project.title, { left: 970, top: 30, width: 242, height: 24 }, { fontSize: 11, color: C.muted, alignment: "right" });
-  addRule(slide, PAGE.left, 64, PAGE.width);
+  addText(slide, String(index + 1).padStart(2, "0"), { left: PAGE.left, top: 31, width: 70, height: 22 }, { fontSize: 12, bold: true, color: C.violet });
+  addText(slide, data.project.title, { left: 908, top: 31, width: 304, height: 22 }, { fontSize: 10, color: C.muted, alignment: "right" });
+  addRule(slide, PAGE.left, 64, PAGE.width, C.line);
 }
 
 function addFooter(slide, slideData, index) {
   const citations = (slideData.citations || []).slice(0, 2);
   let sourceText = citations.length
     ? citations.map((item) => item.doi || item.url || item.title).join("  ·  ")
-    : "PPTKiller · AI generated, human approved";
+    : "PPTKiller · human approved";
   if (slideData.image_author || slideData.image_source) {
     let sourceHost = "";
     try {
@@ -105,16 +106,16 @@ function addBullets(slide, bullets, position, options = {}) {
 
 async function buildCover(slide, item, image) {
   slide.background.fill = C.white;
-  addRect(slide, { left: 0, top: 0, width: 20, height: 720 }, C.violet, C.violet);
-  addText(slide, "PPTKILLER / PROFESSIONAL DECK", { left: 74, top: 72, width: 430, height: 28 }, { fontSize: 13, bold: true, color: C.violet });
-  addText(slide, item.title, { left: 74, top: 184, width: image ? 590 : 1020, height: 180 }, { fontSize: 58, bold: true, color: C.ink }, "deck-title");
-  addText(slide, data.project.topic || item.key_message || "", { left: 78, top: 390, width: image ? 560 : 930, height: 100 }, { fontSize: 24, color: C.muted });
-  addRule(slide, 78, 536, 120, C.violet, 4);
-  addText(slide, `${data.project.slide_count} 页 · ${data.project.speaker_notes_enabled ? "含演讲稿" : "不含演讲稿"}`, { left: 78, top: 558, width: 430, height: 28 }, { fontSize: 14, color: C.muted });
+  addRect(slide, { left: 0, top: 0, width: 1280, height: 720 }, C.white, C.white);
+  addRect(slide, { left: 0, top: 0, width: 1280, height: 14 }, C.navy, C.navy);
+  addText(slide, "PPTKILLER / CONSULTING DECK", { left: 76, top: 76, width: 430, height: 24 }, { fontSize: 12, bold: true, color: C.violet });
+  addText(slide, item.title, { left: 76, top: 178, width: image ? 610 : 1000, height: 168 }, { fontSize: 50, bold: true, color: C.ink }, "deck-title");
+  addText(slide, data.project.topic || item.key_message || "", { left: 78, top: 368, width: image ? 560 : 900, height: 92 }, { fontSize: 20, color: C.muted });
+  addRule(slide, 78, 514, 112, C.violet, 4);
+  addText(slide, `${data.project.slide_count} 页 · ${data.project.speaker_notes_enabled ? "含演讲稿" : "不含演讲稿"}`, { left: 78, top: 540, width: 430, height: 26 }, { fontSize: 13, color: C.muted });
   if (image) {
-    addRect(slide, { left: 760, top: 0, width: 520, height: 720 }, C.pale, C.pale);
-    slide.images.add({ blob: image, contentType: item.image_content_type || "image/jpeg", alt: item.image_alt || item.title, fit: "cover", position: { left: 760, top: 0, width: 520, height: 720 } });
-    addRect(slide, { left: 720, top: 0, width: 120, height: 720 }, C.navy, C.navy);
+    addRect(slide, { left: 760, top: 78, width: 420, height: 520 }, C.pale, C.pale, 10);
+    slide.images.add({ blob: image, contentType: item.image_content_type || "image/jpeg", alt: item.image_alt || item.title, fit: "cover", position: { left: 760, top: 78, width: 420, height: 520 }, geometry: "roundRect", borderRadius: 10 });
   }
 }
 
@@ -175,6 +176,50 @@ function buildProcess(slide, item, index) {
   addFooter(slide, item, index);
 }
 
+function buildArchitectureSlide(slide, item, index) {
+  slide.background.fill = C.white;
+  addHeader(slide, item, index);
+  addText(slide, item.title, { left: PAGE.left, top: 88, width: 900, height: 52 }, { fontSize: 34, bold: true });
+  addText(slide, item.key_message || item.visual_rationale || "用主链路说明模块、关系与反馈闭环", { left: PAGE.left, top: 146, width: 920, height: 40 }, { fontSize: 17, color: C.muted });
+  addText(slide, item.diagram_title || "主链路架构", { left: PAGE.left, top: 214, width: 520, height: 28 }, { fontSize: 18, bold: true, color: C.violet });
+
+  const modules = architectureModules(item);
+  const gap = 18;
+  const moduleWidth = (PAGE.width - gap * (modules.length - 1)) / Math.max(modules.length, 1);
+  const top = 280;
+  modules.forEach((module, moduleIndex) => {
+    const left = PAGE.left + moduleIndex * (moduleWidth + gap);
+    addRect(slide, { left, top, width: moduleWidth, height: 250 }, C.panel, C.line, 8);
+    addText(slide, String(moduleIndex + 1).padStart(2, "0"), { left: left + 18, top: top + 18, width: 38, height: 20 }, { fontSize: 12, bold: true, color: C.violet });
+    addText(slide, module.label, { left: left + 18, top: top + 46, width: moduleWidth - 36, height: 42 }, { fontSize: 17, bold: true, color: C.ink });
+    (module.children || []).slice(0, 2).forEach((child, childIndex) => {
+      const childTop = top + 112 + childIndex * 58;
+      addRect(slide, { left: left + 16, top: childTop, width: moduleWidth - 32, height: 44 }, C.white, C.line, 6);
+      addText(slide, child.label || child.detail || "", { left: left + 28, top: childTop + 10, width: moduleWidth - 56, height: 18 }, { fontSize: 11, bold: true, color: C.ink });
+      if (child.detail) addText(slide, child.detail, { left: left + 28, top: childTop + 27, width: moduleWidth - 56, height: 13 }, { fontSize: 8, color: C.muted });
+    });
+    if (moduleIndex < modules.length - 1) {
+      const x = left + moduleWidth + 4;
+      addRule(slide, x, top + 126, gap - 8, C.violet, 2);
+      addText(slide, "→", { left: x + gap - 18, top: top + 113, width: 20, height: 22 }, { fontSize: 16, bold: true, color: C.violet });
+    }
+  });
+  if (item.visual_rationale) addText(slide, item.visual_rationale, { left: PAGE.left, top: 560, width: PAGE.width, height: 32 }, { fontSize: 13, color: C.muted, alignment: "center" });
+  addFooter(slide, item, index);
+}
+
+function architectureModules(item) {
+  if (item.diagram_modules?.length) return item.diagram_modules.slice(0, 5);
+  const nodes = (item.diagram_nodes || []).slice(0, 10);
+  const layers = item.diagram_layers?.length ? item.diagram_layers.slice(0, 5) : [...new Set(nodes.map((node) => node.layer).filter(Boolean))].slice(0, 5);
+  const fallbackLayers = layers.length ? layers : ["输入", "处理", "输出"];
+  return fallbackLayers.map((layer, index) => ({
+    id: `module_${index + 1}`,
+    label: layer,
+    children: nodes.filter((node) => node.layer === layer).slice(0, 2).map((node) => ({ label: node.label || node.id, detail: node.detail || "" })),
+  }));
+}
+
 function buildEvidence(slide, item, index) {
   slide.background.fill = C.white;
   addHeader(slide, item, index);
@@ -194,6 +239,86 @@ function buildEvidence(slide, item, index) {
     addText(slide, "本页结论来自用户资料与检索结果的综合归纳。正式交付前建议补充可核验来源。", { left: 876, top: 270, width: 300, height: 150 }, { fontSize: 16, color: C.muted });
   }
   addFooter(slide, item, index);
+}
+
+function buildDataSlide(slide, item, index) {
+  slide.background.fill = C.white;
+  addHeader(slide, item, index);
+  addText(slide, item.title, { left: PAGE.left, top: 88, width: 780, height: 62 }, { fontSize: 38, bold: true });
+  addText(slide, item.key_message || "数据支撑核心判断", { left: PAGE.left, top: 154, width: 850, height: 46 }, { fontSize: 18, color: C.muted });
+  const chartType = item.chart_type || "table";
+  if (chartType === "table") buildDataTable(slide, item);
+  else if (chartType === "kpi") buildKpis(slide, item);
+  else buildChart(slide, item, chartType);
+  const source = item.data_source ? `数据来源：${item.data_source.filename || ""}${item.data_source.sheet ? ` / ${item.data_source.sheet}` : ""}` : "";
+  addText(slide, source, { left: PAGE.left, top: 628, width: 720, height: 24 }, { fontSize: 11, color: C.muted });
+  addFooter(slide, item, index);
+}
+
+function buildChart(slide, item, chartType) {
+  const series = (item.data_series || [])[0];
+  const points = (series?.points || []).slice(0, 8);
+  if (!points.length) return buildDataTable(slide, item);
+  const values = points.map((point) => Number(point.value) || 0);
+  const max = Math.max(...values, 1);
+  const left = 92;
+  const top = 250;
+  const width = 720;
+  const height = 300;
+  addRule(slide, left, top + height, width, C.line, 2);
+  addRule(slide, left, top, 1, C.line, height);
+  if (chartType === "line") {
+    points.forEach((point, pointIndex) => {
+      const x = left + 22 + pointIndex * ((width - 44) / Math.max(points.length - 1, 1));
+      const y = top + height - (values[pointIndex] / max) * (height - 36);
+      addRect(slide, { left: x - 4, top: y - 4, width: 8, height: 8 }, C.violet, C.violet, 4);
+      if (pointIndex > 0) {
+        const prevX = left + 22 + (pointIndex - 1) * ((width - 44) / Math.max(points.length - 1, 1));
+        const prevY = top + height - (values[pointIndex - 1] / max) * (height - 36);
+        addRule(slide, Math.min(prevX, x), Math.min(prevY, y), Math.hypot(x - prevX, y - prevY), C.violet, 3);
+      }
+      addText(slide, point.label, { left: x - 34, top: top + height + 16, width: 68, height: 22 }, { fontSize: 10, color: C.muted, alignment: "center" });
+    });
+  } else {
+    const gap = 16;
+    const barWidth = (width - gap * (points.length + 1)) / points.length;
+    points.forEach((point, pointIndex) => {
+      const barHeight = (values[pointIndex] / max) * (height - 36);
+      const x = left + gap + pointIndex * (barWidth + gap);
+      const y = top + height - barHeight;
+      addRect(slide, { left: x, top: y, width: barWidth, height: barHeight }, C.violet, C.violet, 4);
+      addText(slide, point.label, { left: x - 8, top: top + height + 16, width: barWidth + 16, height: 22 }, { fontSize: 10, color: C.muted, alignment: "center" });
+      addText(slide, point.value, { left: x - 8, top: y - 28, width: barWidth + 16, height: 20 }, { fontSize: 11, color: C.ink, alignment: "center", bold: true });
+    });
+  }
+  buildKpis(slide, item, { left: 875, top: 250, width: 270 });
+}
+
+function buildDataTable(slide, item) {
+  const headers = (item.data_table?.headers || []).slice(0, 5);
+  const rows = (item.data_table?.rows || []).slice(0, 7);
+  const left = PAGE.left;
+  const top = 230;
+  const colWidth = 1030 / Math.max(headers.length, 1);
+  addRect(slide, { left, top, width: 1030, height: 36 }, C.navy, C.navy);
+  headers.forEach((header, index) => addText(slide, header, { left: left + index * colWidth + 10, top: top + 9, width: colWidth - 20, height: 20 }, { fontSize: 12, color: C.white, bold: true }));
+  rows.forEach((row, rowIndex) => {
+    const y = top + 36 + rowIndex * 42;
+    addRect(slide, { left, top: y, width: 1030, height: 42 }, rowIndex % 2 ? C.white : C.panel, C.line);
+    headers.forEach((_, colIndex) => addText(slide, row[colIndex] || "", { left: left + colIndex * colWidth + 10, top: y + 12, width: colWidth - 20, height: 20 }, { fontSize: 11, color: C.ink }));
+  });
+}
+
+function buildKpis(slide, item, box = { left: PAGE.left, top: 238, width: PAGE.width }) {
+  const kpis = (item.kpis || []).slice(0, 4);
+  if (!kpis.length) return;
+  const cardWidth = box.width / kpis.length - 12;
+  kpis.forEach((kpi, index) => {
+    const x = box.left + index * (cardWidth + 12);
+    addRect(slide, { left: x, top: box.top, width: cardWidth, height: 112 }, C.panel, C.line, 8);
+    addText(slide, kpi.label, { left: x + 18, top: box.top + 18, width: cardWidth - 36, height: 24 }, { fontSize: 12, color: C.muted });
+    addText(slide, kpi.value, { left: x + 18, top: box.top + 50, width: cardWidth - 36, height: 40 }, { fontSize: 30, bold: true, color: C.violet });
+  });
 }
 
 function buildSummary(slide, item, index) {
@@ -220,7 +345,9 @@ for (const [index, item] of data.slides.entries()) {
   else if (layout === "statement") buildStatement(slide, item, index);
   else if (layout === "two_column") buildTwoColumn(slide, item, index);
   else if (layout === "process") buildProcess(slide, item, index);
-  else if (layout === "evidence" || layout === "data") buildEvidence(slide, item, index);
+  else if (layout === "architecture") buildArchitectureSlide(slide, item, index);
+  else if (layout === "data") buildDataSlide(slide, item, index);
+  else if (layout === "evidence") buildEvidence(slide, item, index);
   else if (layout === "summary") buildSummary(slide, item, index);
   else if (image) await buildImageSplit(slide, item, image, index);
   else buildTwoColumn(slide, item, index);

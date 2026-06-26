@@ -62,6 +62,11 @@ def test_parses_docx_pptx_xlsx_and_pdf(tmp_path):
     xlsx = parser.parse(str(xlsx_path), xlsx_path.name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     assert xlsx["stats"]["sheets"] == 1
     assert "收入" in xlsx["text"]
+    profile = xlsx["tables"][0]["data_profile"]
+    assert profile["chart_type"] == "bar"
+    assert profile["category_column"] == "年份"
+    assert profile["value_columns"] == ["收入"]
+    assert profile["series"][0]["points"] == [{"label": "2025", "value": 100.0}]
 
     pdf_path = tmp_path / "blank.pdf"
     writer = PdfWriter()

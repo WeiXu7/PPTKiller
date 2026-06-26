@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
@@ -76,6 +78,21 @@ class ApprovalRequest(BaseModel):
     feedback: str = ""
 
 
+class SlideUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=240)
+    layout: Literal["cover", "image_split", "statement", "two_column", "process", "architecture", "evidence", "summary", "content", "data", "case"]
+    bullets: list[str] = Field(default_factory=list, max_length=8)
+    key_message: str = Field(default="", max_length=500)
+    speaker_notes: str = Field(default="", max_length=4000)
+
+
+class SlideImageRequest(BaseModel):
+    mode: Literal["auto", "none", "search", "upload"] = "auto"
+    query: str = Field(default="", max_length=240)
+    asset_id: str = ""
+    image: dict = Field(default_factory=dict)
+
+
 class EventRead(ORMModel):
     id: str
     step_key: str
@@ -103,12 +120,25 @@ class ExportSlideRead(BaseModel):
     thumbnail_url: str
 
 
+class ExportWarningRead(BaseModel):
+    code: str
+    severity: str
+    message: str
+    slide_number: int | None = None
+
+
 class ExportArtifactRead(BaseModel):
     session_id: str
     project_id: str
     project_title: str
     slide_count: int
     created_at: str
+    file_status: str = "ready"
+    pptx_size_bytes: int = 0
+    design_template: str = "consulting-default"
+    template_version: str = "1.0"
+    renderer_version: str = ""
     pptx_url: str
     montage_url: str
+    warnings: list[ExportWarningRead] = Field(default_factory=list)
     slides: list[ExportSlideRead]
