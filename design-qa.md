@@ -1,8 +1,8 @@
 **Comparison**
 
-- Source visual truth: `design-reference.png`
-- Implementation screenshot: `frontend-workspace.png`
-- Side-by-side evidence: `design-comparison.png`
+- Source visual truth: `docs/design/design-reference.png`
+- Implementation screenshot: `docs/design/frontend-workspace.png`
+- Side-by-side evidence: `docs/design/design-comparison.png`
 - Viewport: 1440 × 1024
 - State: authenticated project workspace after both approval gates; Agent status `completed`
 - Focused region comparison: the full-height 1440 × 1024 comparison keeps the sidebar, timeline, preview, source panels, and composer readable enough for this pass.
