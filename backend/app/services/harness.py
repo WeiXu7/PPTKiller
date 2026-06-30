@@ -19,6 +19,7 @@ class HarnessStep:
 STEPS = [
     HarnessStep("brief", "理解需求（理解简报）", "提取主题、受众、目标与交付约束"),
     HarnessStep("parse", "解析上传内容（文档与图片）", "抽取事实、表格、图片描述与可引用信息"),
+    HarnessStep("case_prepare", "病例准备度评估", "生成病例收集清单、病例盘点与补充问题", True),
     HarnessStep("research", "搜索网络与学术文献", "检索可追溯网页资料、论文与 DOI"),
     HarnessStep("verify", "验证与筛选引用来源", "去重并校验作者、年份、期刊与链接"),
     HarnessStep("images", "查找与筛选图片素材", "保留作者、来源和授权信息"),
@@ -74,6 +75,9 @@ class AgentHarness:
     async def _run_until_gate(self, session: AgentSession, project: Project) -> None:
         while session.current_step < len(STEPS):
             step = STEPS[session.current_step]
+            if step.key == "case_prepare" and (session.brief or {}).get("presentation_mode") != "radiology_case":
+                session.current_step += 1
+                continue
             payload = await self._execute(step.key, project, session)
             event_status = "failed" if payload.get("fatal") else "completed"
             self._event(session, step.key, event_status, step.title, payload.get("note", step.detail), payload)
@@ -104,6 +108,8 @@ class AgentHarness:
             }
         if key == "parse":
             return await self.services.parse_assets(project)
+        if key == "case_prepare":
+            return await self.services.case_prepare(project, session.brief or {}, artifacts.get("parse", {}))
         if key == "research":
             return await self.services.research(project)
         if key == "verify":

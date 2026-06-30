@@ -11,15 +11,16 @@ from sqlalchemy.orm import Session, selectinload
 from .config import get_settings
 from .database import get_db
 from .dependencies import get_current_user
-from .models import AgentSession, Project, ProjectAsset, User
+from .models import AgentEvent, AgentSession, Project, ProjectAsset, User
 from .schemas import (
     ApprovalRequest, AssetRead, AuthResponse, LoginRequest, ProjectCreate, ProjectRead,
     ExportArtifactRead, RevisionRequest, SessionRead, SessionStart, SlideImageRequest, SlideUpdateRequest, UserCreate, UserRead,
 )
 from .security import create_access_token, hash_password, verify_password
-from .services.harness import AgentHarness
+from .services.agent_services import AgentServices
+from .services.harness import AgentHarness, STEPS
 from .services.pptx_export import export_montage_path, export_pptx, export_thumbnail_path, public_export_manifest
-from .services.providers import CrossrefLiteratureProvider, UnsplashImageProvider, provider_status
+from .services.providers import UnsplashImageProvider, provider_status
 
 router = APIRouter()
 
@@ -174,6 +175,44 @@ def apply_slide_image_assignment(session: AgentSession, slide_number: int, assig
     return _replace_slide(session, slide_number, updater)
 
 
+async def refresh_case_preparation(session: AgentSession, project: Project, db: Session) -> AgentSession:
+    if (session.brief or {}).get("presentation_mode") != "radiology_case":
+        raise HTTPException(status_code=409, detail="当前会话不是影像病例驱动模式")
+
+    services = AgentServices(db)
+    parsed = await services.parse_assets(project)
+    case_prepare = await services.case_prepare(project, session.brief or {}, parsed)
+    artifacts = dict(session.artifacts or {})
+    artifacts["parse"] = parsed
+    artifacts["case_prepare"] = case_prepare
+    artifacts.pop("outline", None)
+    artifacts.pop("slides", None)
+    artifacts.pop("notes", None)
+    artifacts.pop("review", None)
+    artifacts["_case_prepare_revision"] = datetime.now(timezone.utc).isoformat()
+    session.artifacts = artifacts
+    session.current_step = next(index for index, step in enumerate(STEPS) if step.key == "case_prepare")
+    session.status = "waiting_approval"
+    project.status = "generating"
+    db.add(AgentEvent(
+        session_id=session.id,
+        step_key="parse",
+        status="completed",
+        title="解析上传内容（文档与图片）",
+        detail=parsed.get("note", "已重新解析上传病例材料。"),
+        payload=parsed,
+    ))
+    db.add(AgentEvent(
+        session_id=session.id,
+        step_key="case_prepare",
+        status="completed",
+        title="病例准备度评估",
+        detail=case_prepare.get("note", "已重新生成病例准备度评估。"),
+        payload=case_prepare,
+    ))
+    return session
+
+
 @router.post("/auth/register", response_model=AuthResponse, status_code=201)
 def register(payload: UserCreate, db: Session = Depends(get_db)):
     if db.scalar(select(User).where(User.email == payload.email.lower())):
@@ -270,8 +309,8 @@ def list_assets(project_id: str, user: User = Depends(get_current_user), db: Ses
 
 @router.get("/research/literature")
 async def search_literature(q: str, limit: int = 8, user: User = Depends(get_current_user)):
-    results = await CrossrefLiteratureProvider().search(q, min(max(limit, 1), 20))
-    return [citation.__dict__ for citation in results]
+    results = await AgentServices(None)._literature_search(q)
+    return results[: min(max(limit, 1), 20)]
 
 
 @router.get("/research/images")
@@ -306,6 +345,18 @@ async def revise_session(
 ):
     session, project = owned_session(db, user, session_id)
     return await AgentHarness(db).revise(session, project, payload.instruction)
+
+
+@router.post("/sessions/{session_id}/case-prepare/refresh", response_model=SessionRead)
+async def refresh_session_case_prepare(
+    session_id: str,
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    session, project = owned_session(db, user, session_id)
+    await refresh_case_preparation(session, project, db)
+    db.commit()
+    db.refresh(session)
+    return session
 
 
 @router.patch("/sessions/{session_id}/slides/{slide_number}", response_model=SessionRead)

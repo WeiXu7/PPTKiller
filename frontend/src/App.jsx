@@ -11,6 +11,7 @@ import { api, downloadExport, getToken, protectedBlobUrl, setToken } from "./api
 const STEP_DEFINITIONS = [
   ["brief", "理解需求（理解简报）", "提取主题、受众、目标与交付约束"],
   ["parse", "解析上传内容（文档与图片）", "抽取事实、表格、图片描述与可引用信息"],
+  ["case_prepare", "病例准备度评估", "生成病例收集清单、病例盘点与补充问题"],
   ["research", "搜索网络与学术文献", "检索可追溯网页资料、论文与 DOI"],
   ["verify", "验证与筛选引用来源", "去重并校验作者、年份、期刊与链接"],
   ["images", "查找与筛选图片素材", "保留作者、来源和授权信息"],
@@ -41,6 +42,72 @@ function formatTime(value) {
   return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
+const MATERIAL_ACCEPT = ".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.tsv,.txt,.md,image/*";
+const MATERIAL_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".tsv", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tiff", ".bmp"]);
+
+function uploadDescription(file, label) {
+  const relativePath = file.relativePathOverride || file.webkitRelativePath || file.name;
+  return relativePath ? `${label}：${relativePath}` : label;
+}
+
+function materialFiles(fileList) {
+  return Array.from(fileList || []).filter((file) => {
+    const name = (file.relativePathOverride || file.webkitRelativePath || file.name || "").toLowerCase();
+    if (!name || name.includes("/.") || name.startsWith(".")) return false;
+    const dot = name.lastIndexOf(".");
+    return file.type?.startsWith("image/") || (dot >= 0 && MATERIAL_EXTENSIONS.has(name.slice(dot)));
+  });
+}
+
+function fileFromEntry(entry, relativePath) {
+  return new Promise((resolve, reject) => {
+    entry.file((file) => {
+      Object.defineProperty(file, "relativePathOverride", {
+        value: relativePath,
+        configurable: true,
+      });
+      resolve(file);
+    }, reject);
+  });
+}
+
+function readEntries(reader) {
+  return new Promise((resolve, reject) => {
+    reader.readEntries(resolve, reject);
+  });
+}
+
+async function filesFromEntry(entry, prefix = "") {
+  const relativePath = `${prefix}${entry.name}`;
+  if (entry.isFile) return [await fileFromEntry(entry, relativePath)];
+  if (!entry.isDirectory) return [];
+  const reader = entry.createReader();
+  const files = [];
+  while (true) {
+    const entries = await readEntries(reader);
+    if (!entries.length) break;
+    for (const child of entries) {
+      files.push(...await filesFromEntry(child, `${relativePath}/`));
+    }
+  }
+  return files;
+}
+
+async function droppedMaterialFiles(dataTransfer) {
+  const items = Array.from(dataTransfer?.items || []);
+  if (!items.length) return materialFiles(dataTransfer?.files);
+  const files = [];
+  for (const item of items) {
+    const entry = item.webkitGetAsEntry?.();
+    if (entry) files.push(...await filesFromEntry(entry));
+    else {
+      const file = item.getAsFile?.();
+      if (file) files.push(file);
+    }
+  }
+  return materialFiles(files);
+}
+
 function payloadChips(key, payload = {}) {
   if (key === "parse") {
     const summary = [
@@ -57,18 +124,22 @@ function payloadChips(key, payload = {}) {
   }
   if (key === "verify") return [`已验证 ${payload.verified || 0} 条`, `DOI ${payload.doi_checked || 0} 条`];
   if (key === "images") return [`找到 ${payload.found || 0} 张`, `筛选 ${payload.selected || 0} 张`];
+  if (key === "case_prepare") return [payload.readiness_label || "待评估", `${payload.case_count || 0} 个病例`, `${payload.next_questions?.length || 0} 个补充问题`];
   if (key === "outline") return (payload.slides || []).slice(0, 6).map((slide) => slide.title);
   return [];
 }
 
 function sessionToSteps(session) {
-  if (!session) return STEP_DEFINITIONS.map(([key, title, detail]) => ({ key, title, detail, state: "waiting" }));
-  const events = new Map((session.events || []).filter((event) => STEP_DEFINITIONS.some(([key]) => key === event.step_key)).map((event) => [event.step_key, event]));
-  return STEP_DEFINITIONS.map(([key, title, fallbackDetail], index) => {
+  const definitions = STEP_DEFINITIONS
+    .map((definition, originalIndex) => ({ definition, originalIndex }))
+    .filter(({ definition }) => definition[0] !== "case_prepare" || session?.brief?.presentation_mode === "radiology_case");
+  if (!session) return definitions.map(({ definition: [key, title, detail] }) => ({ key, title, detail, state: "waiting" }));
+  const events = new Map((session.events || []).filter((event) => definitions.some(({ definition: [key] }) => key === event.step_key)).map((event) => [event.step_key, event]));
+  return definitions.map(({ definition: [key, title, fallbackDetail], originalIndex }, index) => {
     const event = events.get(key);
     let state = event ? "done" : "waiting";
-    if (session.status === "waiting_approval" && index === session.current_step) state = "approval";
-    else if (session.status === "running" && index === session.current_step) state = "active";
+    if (session.status === "waiting_approval" && originalIndex === session.current_step) state = "approval";
+    else if (session.status === "running" && originalIndex === session.current_step) state = "active";
     const payload = event?.payload || session.artifacts?.[key] || {};
     return {
       key,
@@ -277,7 +348,7 @@ function DraftSlide({ project, slide }) {
   );
 }
 
-function Preview({ project, session, activeSlide, setActiveSlide, onOpenEditor, onDownload }) {
+function Preview({ project, session, activeSlide, setActiveSlide, busy, onOpenEditor, onDownload, onUploadCaseMaterials }) {
   const outline = session?.artifacts?.outline?.slides || [{ title: project?.title || "等待生成大纲" }];
   const selected = outline[activeSlide] || outline[0];
   const [exportArtifact, setExportArtifact] = useState(null);
@@ -294,6 +365,7 @@ function Preview({ project, session, activeSlide, setActiveSlide, onOpenEditor, 
   const selectedThumb = thumbnails[activeSlide + 1];
   const outlineTemplate = session?.artifacts?.outline?.design_template;
   const visibleTemplate = exportArtifact?.design_template || outlineTemplate || "consulting-default";
+  const casePrepare = session?.artifacts?.case_prepare;
 
   useEffect(() => {
     let cancelled = false;
@@ -372,6 +444,7 @@ function Preview({ project, session, activeSlide, setActiveSlide, onOpenEditor, 
               <li>{exportArtifact ? `已生成 ${exportArtifact.slide_count} 页真实导出预览` : "可编辑 PPTX 将在流程完成后导出"}</li>
             </ul>
           </div>
+          {casePrepare && <CaseReadinessPanel payload={casePrepare} busy={busy} onUpload={onUploadCaseMaterials} />}
           <div className="qaPanel">
             <header><h4>导出 QA</h4><span className={`qaStatus ${exportArtifact?.file_status || exportPreviewState}`}>{exportArtifact?.file_status === "ready" ? "文件就绪" : exportPreviewState === "failed" ? "生成失败" : exportPreviewState === "loading" ? "检查中" : "等待导出"}</span></header>
             <dl>
@@ -409,6 +482,48 @@ function Preview({ project, session, activeSlide, setActiveSlide, onOpenEditor, 
         </div>
       </div>
     </section>
+  );
+}
+
+function CaseReadinessPanel({ payload, busy, onUpload }) {
+  const readinessClass = payload.readiness === "not_recommended" ? "warning" : payload.readiness === "ready" ? "ready" : "caution";
+  const inputRef = useRef(null);
+  const folderRef = useRef(null);
+  async function selectFiles(event) {
+    const files = materialFiles(event.target.files);
+    if (files.length) await onUpload(files);
+    if (inputRef.current) inputRef.current.value = "";
+    if (folderRef.current) folderRef.current.value = "";
+  }
+  async function dropFiles(event) {
+    event.preventDefault();
+    const files = await droppedMaterialFiles(event.dataTransfer);
+    if (files.length) await onUpload(files);
+  }
+  return (
+    <div className={`casePanel ${readinessClass}`} onDragOver={(event) => event.preventDefault()} onDrop={dropFiles}>
+      <header><h4>病例准备度</h4><span>{payload.readiness_label || "待评估"}</span></header>
+      <dl>
+        <div><dt>病例材料</dt><dd>{payload.case_count || 0}</dd></div>
+        <div><dt>上传资料</dt><dd>{payload.asset_count || 0}</dd></div>
+        <div><dt>模式</dt><dd>影像病例</dd></div>
+      </dl>
+      <input ref={inputRef} className="fileInput" type="file" multiple accept={MATERIAL_ACCEPT} onChange={selectFiles} />
+      <input ref={folderRef} className="fileInput" type="file" multiple webkitdirectory="" directory="" onChange={selectFiles} />
+      <div className="caseUploadActions">
+        <button type="button" className="caseUploadButton" disabled={busy} onClick={() => inputRef.current?.click()}><UploadSimple /> 选择文件</button>
+        <button type="button" className="caseUploadButton" disabled={busy} onClick={() => folderRef.current?.click()}><Folder /> 选择文件夹</button>
+      </div>
+      <p className="dropHint">也可以把病例文件夹直接拖到这里，支持递归读取子文件夹。</p>
+      {payload.case_collection_checklist?.length > 0 && (
+        <div className="caseChecklist">
+          {payload.case_collection_checklist.slice(0, 3).map((item) => <span key={item.role}>{item.required ? "必备" : "可选"} · {item.label}</span>)}
+        </div>
+      )}
+      {payload.next_questions?.length > 0 && (
+        <ul>{payload.next_questions.slice(0, 4).map((question) => <li key={question}>{question}</li>)}</ul>
+      )}
+    </div>
   );
 }
 
@@ -535,14 +650,20 @@ function Composer({ disabled, onSend }) {
 function NewProjectModal({ busy, onClose, onCreate }) {
   const [title, setTitle] = useState("人工智能如何改变知识工作");
   const [topic, setTopic] = useState("研究行业现状、影响与行动建议");
+  const [presentationMode, setPresentationMode] = useState("general");
   const [slideCount, setSlideCount] = useState("15");
   const [notes, setNotes] = useState("true");
   const [files, setFiles] = useState([]);
   const inputRef = useRef(null);
+  const folderRef = useRef(null);
   const submit = (event) => {
     event.preventDefault();
-    onCreate({ title, topic, slide_count: Number(slideCount), speaker_notes_enabled: notes === "true", files });
+    onCreate({ title, topic, slide_count: Number(slideCount), speaker_notes_enabled: notes === "true", presentation_mode: presentationMode, files });
   };
+  async function dropFiles(event) {
+    event.preventDefault();
+    setFiles(await droppedMaterialFiles(event.dataTransfer));
+  }
   return (
     <div className="modalBackdrop" onMouseDown={busy ? undefined : onClose}>
       <form className="modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
@@ -550,11 +671,20 @@ function NewProjectModal({ busy, onClose, onCreate }) {
         <label>项目标题<input required value={title} onChange={(event) => setTitle(event.target.value)} /></label>
         <label className="modalTopic">研究主题与要求<textarea required value={topic} onChange={(event) => setTopic(event.target.value)} /></label>
         <div className="modalGrid">
+          <label>演示模式<select value={presentationMode} onChange={(event) => setPresentationMode(event.target.value)}><option value="general">通用演示</option><option value="radiology_case">影像病例驱动</option></select></label>
           <label>目标页数<select value={slideCount} onChange={(event) => setSlideCount(event.target.value)}><option>10</option><option>15</option><option>20</option></select></label>
-          <label>演讲稿<select value={notes} onChange={(event) => setNotes(event.target.value)}><option value="true">生成</option><option value="false">不生成</option></select></label>
         </div>
-        <input ref={inputRef} className="fileInput" type="file" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.md,image/*" onChange={(event) => setFiles(Array.from(event.target.files || []))} />
-        <button type="button" className="upload" onClick={() => inputRef.current?.click()}><UploadSimple size={30} /><b>{files.length ? `已选择 ${files.length} 个文件` : "选择资料或图片"}</b><small>{files.length ? files.map((file) => file.name).join("、") : "单个文件不超过 50MB"}</small></button>
+        <div className="modalGrid">
+          <label>演讲稿<select value={notes} onChange={(event) => setNotes(event.target.value)}><option value="true">生成</option><option value="false">不生成</option></select></label>
+          <div className="modeHint">{presentationMode === "radiology_case" ? "先评估病例准备度，再生成病例讨论 PPT。" : "按主题、资料和引用生成标准演示。"}</div>
+        </div>
+        <input ref={inputRef} className="fileInput" type="file" multiple accept={MATERIAL_ACCEPT} onChange={(event) => setFiles(materialFiles(event.target.files))} />
+        <input ref={folderRef} className="fileInput" type="file" multiple webkitdirectory="" directory="" onChange={(event) => setFiles(materialFiles(event.target.files))} />
+        <div className="uploadGrid" onDragOver={(event) => event.preventDefault()} onDrop={dropFiles}>
+          <button type="button" className="upload" onClick={() => inputRef.current?.click()}><UploadSimple size={30} /><b>{files.length ? `已选择 ${files.length} 个文件` : "选择文件"}</b><small>{files.length ? files.slice(0, 3).map((file) => file.relativePathOverride || file.webkitRelativePath || file.name).join("、") : "支持 CSV、文档、表格和图片"}</small></button>
+          <button type="button" className="upload" onClick={() => folderRef.current?.click()}><Folder size={30} /><b>选择文件夹</b><small>保留病例目录相对路径</small></button>
+        </div>
+        <p className="dropHint">也可以把病例文件夹拖到这里上传，支持二级及更深层目录。</p>
         <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button disabled={busy} className="primary">{busy && <SpinnerGap className="spin" />}创建并开始</button></footer>
       </form>
     </div>
@@ -625,7 +755,7 @@ export function App() {
     setBusy(true);
     try {
       const created = await api.createProject(payload);
-      for (const file of payload.files) await api.upload(created.id, file);
+      for (const file of payload.files) await api.upload(created.id, file, uploadDescription(file, "项目资料"));
       setModalOpen(false);
       setProject(created);
       setProjects((items) => [created, ...items.filter((item) => item.id !== created.id)]);
@@ -633,11 +763,28 @@ export function App() {
       notify(`项目已创建，${payload.files.length} 个文件上传完成，Agent 正在启动`);
       const started = await api.startSession(created.id, {
         audience: "专业听众", tone: "专业、清晰", language: "中文",
-        instructions: payload.topic, require_approval: true,
+        instructions: payload.topic, require_approval: true, presentation_mode: payload.presentation_mode,
       });
       await loadProjects(created.id);
       setSession(started);
       notify("Agent 已运行到第一个人工审批节点");
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadCaseMaterials(files) {
+    if (!project || !session || !files.length) return;
+    setBusy(true);
+    try {
+      for (const file of files) await api.upload(project.id, file, uploadDescription(file, "影像病例材料"));
+      const updated = await api.refreshCasePrepare(session.id);
+      setSession(updated);
+      await loadProjects(project.id);
+      setSession(updated);
+      notify(`已提交 ${files.length} 个材料，并重新评估病例准备度`);
     } catch (error) {
       notify(error.message);
     } finally {
@@ -731,10 +878,10 @@ export function App() {
       <main className="main">
         {project ? <>
           <header className="topbar">
-            <div><h2>{project.title} <PencilSimple /></h2><span>Agent：{session?.status || "未启动"}　·　共 10 个步骤　<b>{completed} 已完成</b></span></div>
+            <div><h2>{project.title} <PencilSimple /></h2><span>Agent：{session?.status || "未启动"}　·　共 {steps.length} 个步骤　<b>{completed} 已完成</b></span></div>
             <div className="topActions"><button onClick={() => notify("团队分享将在后续版本接入")}><ShareNetwork /> 分享</button><button onClick={exportPpt}><DownloadSimple /> 导出PPT</button><button className="primary" disabled={!session?.artifacts?.outline?.slides?.length} onClick={() => setEditorOpen(true)}><PencilSimple /> 打开编辑器 <CaretDown /></button></div>
           </header>
-          <div className="content"><section className="runPanel"><Timeline steps={steps} busy={busy} onApprove={approve} onRevise={() => revise()} /></section><Preview project={project} session={session} activeSlide={activeSlide} setActiveSlide={setActiveSlide} onOpenEditor={() => setEditorOpen(true)} onDownload={exportPpt} /></div>
+          <div className="content"><section className="runPanel"><Timeline steps={steps} busy={busy} onApprove={approve} onRevise={() => revise()} /></section><Preview project={project} session={session} activeSlide={activeSlide} setActiveSlide={setActiveSlide} busy={busy} onOpenEditor={() => setEditorOpen(true)} onDownload={exportPpt} onUploadCaseMaterials={uploadCaseMaterials} /></div>
           {editorOpen && <SlideEditor project={project} session={session} activeSlide={activeSlide} busy={busy} onClose={() => setEditorOpen(false)} onSave={saveSlide} onSaveImage={saveSlideImage} />}
           <Composer disabled={!session || busy} onSend={revise} />
         </> : <EmptyWorkspace onCreate={() => setModalOpen(true)} />}

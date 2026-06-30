@@ -1,0 +1,5 @@
+case_id,teaching_role,age_sex,modality,final_diagnosis,verification,deidentified,key_images,display_mode
+Case-01,typical,65M,Chest CT,Invasive lung adenocarcinoma,Postoperative pathology,Yes,2,reveal-answer-later
+Case-02,differential,52F,Chest CT,Inflammatory pulmonary nodule,Follow-up absorption after anti-inflammatory treatment,Yes,2,side-by-side comparison
+Case-03,pitfall,70M,Chest CT,Pulmonary tuberculoma,Pathology and TB workup,Yes,3,reveal-answer-later
+

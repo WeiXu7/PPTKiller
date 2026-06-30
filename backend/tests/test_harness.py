@@ -7,17 +7,34 @@ from sqlalchemy.orm import sessionmaker
 from backend.app.database import Base
 from backend.app.models import Project, ProjectAsset, User
 from backend.app.security import hash_password, verify_password
-from backend.app.api import apply_slide_update, apply_slide_image_assignment
+from backend.app.api import apply_slide_update, apply_slide_image_assignment, refresh_case_preparation
 from backend.app.schemas import SlideUpdateRequest
 from backend.app.services.agent_services import AgentServices
 from backend.app.services.deck_design import apply_consulting_template, normalize_architecture_diagram
 from backend.app.services.harness import AgentHarness
-from backend.app.services.pptx_export import build_export_warnings, export_pptx, public_export_manifest, _export_with_python_fallback, _render_fallback_qa
+from backend.app.services.providers import Citation, _pubmed_doi, _year_from_pubdate, dedupe_citations
+from backend.app.services.pptx_export import (
+    build_export_warnings, export_pptx, public_export_manifest,
+    _export_with_python_fallback, _local_case_image_for_slide, _local_case_images, _render_fallback_qa,
+)
 
 
 class FakeServices:
     async def parse_assets(self, project):
         return {"count": 0, "files": [], "text_context": "", "note": "无上传资料"}
+
+    async def case_prepare(self, project, brief, parsed):
+        return {
+            "mode": "radiology_case",
+            "readiness": "not_recommended",
+            "readiness_label": "不建议直接生成",
+            "case_count": 0,
+            "asset_count": 0,
+            "case_collection_checklist": [],
+            "case_cards": [],
+            "next_questions": ["请补充已脱敏病例材料。"],
+            "note": "已生成病例准备清单",
+        }
 
     async def research(self, project):
         return {
@@ -105,7 +122,7 @@ def test_harness_completes_after_two_approvals(tmp_path, monkeypatch):
     session = asyncio.run(harness.start(project, {"audience": "管理者"}))
     session = asyncio.run(harness.approve(session, project, True, ""))
     assert session.status == "waiting_approval"
-    assert session.current_step == 8
+    assert session.current_step == 9
     session = asyncio.run(harness.approve(session, project, True, ""))
     assert session.status == "completed"
     assert project.status == "completed"
@@ -114,6 +131,65 @@ def test_harness_completes_after_two_approvals(tmp_path, monkeypatch):
     output = export_pptx(project, session)
     assert output.exists()
     assert output.stat().st_size > 0
+
+
+def test_radiology_case_mode_stops_for_case_preparation():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    user = User(email="radiology@example.com", name="Radiology", password_hash="x")
+    db.add(user)
+    db.flush()
+    project = Project(owner_id=user.id, title="肺结节影像诊断病例教学", topic="病例驱动教学", slide_count=10)
+    db.add(project)
+    db.commit()
+
+    session = asyncio.run(AgentHarness(db, FakeServices()).start(project, {
+        "audience": "影像科医生",
+        "presentation_mode": "radiology_case",
+    }))
+
+    assert session.status == "waiting_approval"
+    assert session.current_step == 2
+    assert session.events[-1].step_key == "case_prepare"
+    assert session.artifacts["case_prepare"]["readiness"] == "not_recommended"
+
+
+def test_refresh_case_preparation_reparses_uploaded_case_material(tmp_path):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    user = User(email="case-refresh@example.com", name="Case Refresh", password_hash="x")
+    db.add(user)
+    db.flush()
+    project = Project(owner_id=user.id, title="肺结节影像诊断病例教学", topic="病例驱动教学", slide_count=10)
+    db.add(project)
+    db.commit()
+    session = asyncio.run(AgentHarness(db, FakeServices()).start(project, {
+        "audience": "影像科医生",
+        "presentation_mode": "radiology_case",
+    }))
+
+    case_file = tmp_path / "case-001.txt"
+    case_file.write_text("65岁男性，CT 增强检查。最终诊断：肺腺癌，病理确认。材料已脱敏。", encoding="utf-8")
+    db.add(ProjectAsset(
+        project_id=project.id,
+        filename=case_file.name,
+        content_type="text/plain",
+        path=str(case_file),
+        description="典型病例",
+        size_bytes=case_file.stat().st_size,
+    ))
+    db.commit()
+
+    refreshed = asyncio.run(refresh_case_preparation(session, project, db))
+
+    assert refreshed.status == "waiting_approval"
+    assert refreshed.current_step == 2
+    assert refreshed.artifacts["parse"]["count"] == 1
+    card = refreshed.artifacts["case_prepare"]["case_cards"][0]
+    assert card["readiness"] == "ready"
+    assert card["modality"] == "CT"
 
 
 def test_update_slide_artifacts_keeps_export_sources_in_sync():
@@ -226,6 +302,106 @@ def test_agent_services_promotes_uploaded_table_to_data_slide():
     assert data_slide["data_series"][0]["name"] == "收入"
 
 
+def test_radiology_outline_does_not_promote_case_index_csv_to_data_slide():
+    project = Project(owner_id="owner", title="肺结节 CT 鉴别诊断病例教学", topic="病例驱动教学", slide_count=10)
+    artifacts = {
+        "case_prepare": {
+            "case_cards": [{
+                "case_id": "Case 01",
+                "source_filename": "Case-01_case-note.md",
+                "modality": "CT",
+                "clinical_background": "65岁男性",
+                "diagnosis_basis": "病理确认",
+                "teaching_role": "typical",
+                "display_mode": "reveal-answer-later",
+                "missing_information": [],
+            }],
+            "case_collection_checklist": [],
+            "readiness_label": "可带警告生成",
+            "case_count": 1,
+        },
+        "parse": {
+            "items": [{
+                "filename": "case-index.csv",
+                "tables": [{
+                    "sheet": "case-index",
+                    "data_profile": {
+                        "chart_type": "bar",
+                        "value_columns": ["key_images"],
+                        "series": [{"name": "key_images", "points": [{"label": "Case-01", "value": 2.0}]}],
+                    },
+                }],
+            }],
+        },
+    }
+
+    outline = AgentServices(None)._fallback_radiology_outline(project, artifacts)
+
+    assert not any(slide.get("layout") == "data" for slide in outline["slides"])
+    assert any((slide.get("case_card") or {}).get("case_id") == "Case 01" for slide in outline["slides"])
+
+
+def test_radiology_outline_follows_reference_teaching_structure():
+    project = Project(owner_id="owner", title="肺结节 CT 鉴别诊断病例教学", topic="病例驱动教学", slide_count=12)
+    artifacts = {
+        "case_prepare": {
+            "case_cards": [
+                {
+                    "case_id": "Case-01",
+                    "modality": "CT",
+                    "clinical_background": "65岁男性",
+                    "diagnosis_basis": "病理确认",
+                    "teaching_role": "典型病例",
+                    "missing_information": [],
+                },
+                {
+                    "case_id": "Case-02",
+                    "modality": "CT",
+                    "clinical_background": "随访复查",
+                    "diagnosis_basis": "随访吸收",
+                    "teaching_role": "鉴别诊断",
+                    "missing_information": [],
+                },
+            ],
+        },
+    }
+
+    outline = AgentServices(None)._fallback_radiology_outline(project, artifacts)
+    titles = [slide["title"] for slide in outline["slides"]]
+
+    assert titles[1:5] == ["正常解剖与检查方法基础", "疾病谱与分类框架", "影像诊断框架与读片路径", "关键征象分解"]
+    assert titles.index("Case-01：典型病例读片问题") < titles.index("Case-01：影像征象与诊断推理")
+    assert titles.index("Case-01：典型病例读片问题") > titles.index("关键征象分解")
+    assert "跨病例对照与鉴别诊断" in titles
+    assert outline["narrative"] == "正常基础—疾病谱分类—征象框架—病例推理—鉴别总结"
+
+
+def test_local_case_images_match_case_slide_before_unsplash():
+    artifacts = {
+        "parse": {
+            "items": [
+                {
+                    "filename": "Case-01_CT_lung-window_key-slice.png",
+                    "description": "影像病例材料：radiology-case-demo/Case-01/Case-01_CT_lung-window_key-slice.png",
+                    "content_type": "image/png",
+                    "path": "/tmp/Case-01_CT_lung-window_key-slice.png",
+                },
+                {
+                    "filename": "Case-02_CT_initial_nodule.png",
+                    "description": "影像病例材料：radiology-case-demo/Case-02/Case-02_CT_initial_nodule.png",
+                    "content_type": "image/png",
+                    "path": "/tmp/Case-02_CT_initial_nodule.png",
+                },
+            ],
+        },
+    }
+    slide = {"title": "典型病例：Case-01 右肺上叶结节", "layout": "content"}
+
+    image = _local_case_image_for_slide(slide, _local_case_images(artifacts))
+
+    assert image["filename"] == "Case-01_CT_lung-window_key-slice.png"
+
+
 def test_fallback_outline_adds_architecture_for_technical_framework():
     project = Project(owner_id="owner", title="RAG Agent 技术架构", topic="讲解检索增强生成系统框架", slide_count=6)
 
@@ -253,7 +429,7 @@ def test_consulting_template_limits_slide_density_and_marks_template():
     templated = apply_consulting_template(outline)
 
     assert templated["design_template"] == "consulting-default"
-    assert templated["template_version"] == "1.0"
+    assert templated["template_version"] == "1.2"
     slide = templated["slides"][0]
     assert slide["design_role"] == "content"
     assert slide["max_bullets"] == 4
@@ -322,7 +498,7 @@ def test_export_manifest_exposes_template_metadata(tmp_path, monkeypatch):
     manifest = public_export_manifest(project, session)
 
     assert manifest["design_template"] == "consulting-default"
-    assert manifest["template_version"] == "1.0"
+    assert manifest["template_version"] == "1.2"
     assert manifest["renderer_version"]
 
 
@@ -513,3 +689,26 @@ def test_verify_classifies_source_quality_and_deduplicates():
     assert citation["access_url"] == "https://doi.org/10.1000/test"
     assert verified["web_sources"][2]["quality_tier"] == "low"
     assert verified["web_sources"][2]["quality_notes"]
+
+
+def test_literature_dedupes_across_providers_by_doi_and_title():
+    citations = [
+        Citation("Same DOI", ["A"], 2024, "Journal", "https://doi.org/10.1/test", "10.1/test", True, "Crossref"),
+        Citation("Different title same DOI", ["B"], 2024, "Journal", "https://example.com", "10.1/TEST", True, "OpenAlex"),
+        Citation("Title Only Paper", [], 2023, "Venue", "https://example.com/a", None, False, "PubMed"),
+        Citation("Title-only paper!", [], 2023, "Venue", "https://example.com/b", None, False, "Semantic Scholar"),
+    ]
+
+    unique = dedupe_citations(citations)
+
+    assert [item.provider for item in unique] == ["Crossref", "PubMed"]
+
+
+def test_pubmed_helpers_extract_doi_and_year():
+    doi = _pubmed_doi([
+        {"idtype": "pubmed", "value": "123"},
+        {"idtype": "doi", "value": "10.1000/pubmed"},
+    ])
+
+    assert doi == "10.1000/pubmed"
+    assert _year_from_pubdate("2025 Jan-Feb") == 2025

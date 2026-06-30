@@ -4,7 +4,7 @@ from copy import deepcopy
 
 
 TEMPLATE_ID = "consulting-default"
-TEMPLATE_VERSION = "1.0"
+TEMPLATE_VERSION = "1.2"
 ALLOWED_LAYOUTS = {"cover", "image_split", "statement", "two_column", "process", "architecture", "evidence", "summary", "content", "data", "case"}
 
 

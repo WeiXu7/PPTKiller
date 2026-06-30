@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_DIR = PROJECT_ROOT / "scripts" / "ppt-runtime"
 ENGINE_SCRIPT = RUNTIME_DIR / "generate-deck.mjs"
 GENERATED_DIR = PROJECT_ROOT / "backend" / "generated"
-RENDERER_VERSION = "consulting-default-renderer-8"
+RENDERER_VERSION = "consulting-default-renderer-9-medical-academic"
 
 
 def export_pptx(project: Project, session: AgentSession) -> Path:
@@ -50,6 +51,7 @@ def ensure_export_artifact(project: Project, session: AgentSession) -> dict:
 
     citations = artifacts.get("verify", {}).get("citations", [])
     images = artifacts.get("images", {}).get("items", [])
+    local_case_images = _local_case_images(artifacts)
     slides = []
     for index, slide in enumerate(outline):
         citation_indices = slide.get("citation_indices") or []
@@ -88,9 +90,22 @@ def ensure_export_artifact(project: Project, session: AgentSession) -> dict:
                 "source_url": assignment.get("source_url"),
             }
             image_path = _download_image(image, asset_dir, index) if image.get("url") else None
-        elif images and uses_image:
-            image = images[index % len(images)]
-            image_path = _download_image(image, asset_dir, index)
+        else:
+            local_image = _local_case_image_for_slide(slide, local_case_images)
+            if local_image and uses_image:
+                image = local_image
+                local_path = Path(local_image.get("path", ""))
+                image_path = local_path if local_path.exists() else None
+            elif images and uses_image:
+                image = images[index % len(images)]
+                image_path = _download_image(image, asset_dir, index)
+        if image_path and (image or {}).get("path"):
+            image = {
+                **(image or {}),
+                "description": (image or {}).get("description") or Path(image_path).name,
+                "author": (image or {}).get("author") or "用户上传病例材料",
+                "source_url": "",
+            }
         slides.append({
             **slide,
             "number": slide.get("number", index + 1),
@@ -218,6 +233,54 @@ def _hydrate_manifest(manifest: dict) -> dict:
         for slide in hydrated.get("slides", [])
     ]
     return hydrated
+
+
+def _case_tokens(*values: str) -> set[str]:
+    text = " ".join(str(value or "") for value in values)
+    return {f"case-{int(match):02d}" for match in re.findall(r"case[-_\s]?0*(\d{1,2})", text, flags=re.IGNORECASE)}
+
+
+def _local_case_images(artifacts: dict) -> list[dict]:
+    items = artifacts.get("parse", {}).get("items", [])
+    images = []
+    for item in items:
+        content_type = item.get("content_type") or ""
+        path = item.get("path") or ""
+        if not content_type.startswith("image/") or not path:
+            continue
+        descriptor = " ".join([
+            item.get("filename", ""),
+            item.get("description", ""),
+            path,
+        ])
+        tokens = _case_tokens(descriptor)
+        images.append({
+            "path": path,
+            "filename": item.get("filename", ""),
+            "description": item.get("description") or item.get("filename", ""),
+            "content_type": content_type,
+            "author": "用户上传病例材料",
+            "case_tokens": tokens,
+        })
+    return images
+
+
+def _local_case_image_for_slide(slide: dict, local_images: list[dict]) -> dict | None:
+    if not local_images:
+        return None
+    card = slide.get("case_card") or {}
+    tokens = _case_tokens(
+        slide.get("title", ""),
+        slide.get("key_message", ""),
+        " ".join(slide.get("bullets") or []),
+        card.get("case_id", ""),
+        card.get("source_filename", ""),
+    )
+    if tokens:
+        for image in local_images:
+            if tokens & image.get("case_tokens", set()):
+                return image
+    return None
 
 
 def public_export_manifest(project: Project, session: AgentSession) -> dict:

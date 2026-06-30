@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from datetime import datetime
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -67,6 +69,7 @@ class SessionStart(BaseModel):
     language: str = "中文"
     instructions: str = ""
     require_approval: bool = True
+    presentation_mode: Literal["general", "radiology_case"] = "general"
 
 
 class RevisionRequest(BaseModel):
@@ -124,7 +127,7 @@ class ExportWarningRead(BaseModel):
     code: str
     severity: str
     message: str
-    slide_number: int | None = None
+    slide_number: Optional[int] = None
 
 
 class ExportArtifactRead(BaseModel):

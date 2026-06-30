@@ -341,7 +341,7 @@ class AssetParser:
     def _number(value: Any) -> float | None:
         if value is None:
             return None
-        if isinstance(value, int | float):
+        if isinstance(value, (int, float)):
             return float(value)
         text = str(value).strip().replace(",", "")
         if text.endswith("%"):

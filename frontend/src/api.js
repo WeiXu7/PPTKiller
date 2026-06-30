@@ -52,6 +52,8 @@ export const api = {
     request(`/sessions/${sessionId}/approve`, { method: "POST", body: JSON.stringify(payload) }),
   revise: (sessionId, instruction) =>
     request(`/sessions/${sessionId}/revise`, { method: "POST", body: JSON.stringify({ instruction }) }),
+  refreshCasePrepare: (sessionId) =>
+    request(`/sessions/${sessionId}/case-prepare/refresh`, { method: "POST" }),
   updateSlide: (sessionId, number, payload) =>
     request(`/sessions/${sessionId}/slides/${number}`, { method: "PATCH", body: JSON.stringify(payload) }),
   updateSlideImage: (sessionId, number, payload) =>

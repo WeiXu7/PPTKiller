@@ -13,7 +13,15 @@ from ..config import Settings, get_settings
 from ..models import Project, ProjectAsset
 from .llm import DeepSeekClient
 from .deck_design import apply_consulting_template
-from .providers import CrossrefLiteratureProvider, TavilyResearchProvider, UnsplashImageProvider
+from .providers import (
+    CrossrefLiteratureProvider,
+    OpenAlexLiteratureProvider,
+    PubMedLiteratureProvider,
+    SemanticScholarLiteratureProvider,
+    TavilyResearchProvider,
+    UnsplashImageProvider,
+    dedupe_citations,
+)
 from .parsers import AssetParser
 
 
@@ -45,6 +53,7 @@ class AgentServices:
                 "id": asset.id,
                 "filename": asset.filename,
                 "content_type": asset.content_type,
+                "path": asset.path,
                 "description": asset.description,
                 "size_bytes": asset.size_bytes,
                 **parsed,
@@ -67,6 +76,51 @@ class AgentServices:
             "ocr_required": len(ocr_items),
             "ocr_items": ocr_items,
             "note": f"已原生解析 {len(files)} 个文件、{total_sections} 个内容区块和 {total_tables} 个表格；{len(ocr_items)} 个文件需要按需 OCR/视觉理解。",
+        }
+
+    async def case_prepare(self, project: Project, brief: dict, parsed: dict) -> dict:
+        topic = f"{project.title} {project.topic}".strip()
+        assets = parsed.get("items", [])
+        checklist = self._radiology_case_checklist(topic)
+        case_cards = self._case_cards_from_assets(assets)
+        if not case_cards:
+            readiness = "not_recommended"
+            readiness_label = "不建议直接生成"
+            missing_summary = ["尚未上传病例材料", "缺少最终诊断/病理/随访支持", "缺少关键图像与脱敏确认"]
+            next_questions = [
+                "请补充 3-5 个已脱敏病例，每个病例至少包含关键图像、检查方式和最终诊断依据。",
+                "是否已有病理、随访结果或临床结局可以作为诊断验证？",
+                "希望本次教学更偏典型征象、鉴别诊断、误诊陷阱，还是多病例对照？",
+            ]
+            note = "已进入影像科病例驱动模式：当前只有主题，建议先收集病例材料，再生成最终 PPT。"
+        else:
+            ready_cards = [card for card in case_cards if card["readiness"] == "ready"]
+            warning_cards = [card for card in case_cards if card["readiness"] == "needs_info"]
+            if len(ready_cards) >= 2 and len(warning_cards) <= len(ready_cards):
+                readiness = "can_generate_with_warnings"
+                readiness_label = "可带警告生成"
+            else:
+                readiness = "not_recommended"
+                readiness_label = "建议补充后生成"
+            missing_summary = sorted({item for card in case_cards for item in card.get("missing_information", [])})
+            next_questions = self._case_followup_questions(case_cards)
+            note = f"已盘点 {len(case_cards)} 个病例材料；{len(ready_cards)} 个相对完整，{len(warning_cards)} 个需要补充信息。"
+
+        storyline = self._radiology_storyline(topic, case_cards)
+        return {
+            "mode": "radiology_case",
+            "topic": topic,
+            "asset_count": len(assets),
+            "case_count": len(case_cards),
+            "readiness": readiness,
+            "readiness_label": readiness_label,
+            "case_collection_checklist": checklist,
+            "case_cards": case_cards,
+            "missing_summary": missing_summary,
+            "next_questions": next_questions,
+            "teaching_storyline": storyline,
+            "approval_required": True,
+            "note": note,
         }
 
     async def research(self, project: Project) -> dict:
@@ -137,7 +191,9 @@ class AgentServices:
             return self._failure("Unsplash", exc, items=[])
 
     async def outline(self, project: Project, brief: dict, artifacts: dict) -> dict:
-        fallback = apply_consulting_template(self.with_data_slides(project, self._fallback_outline(project), artifacts))
+        is_radiology_case = brief.get("presentation_mode") == "radiology_case"
+        fallback_outline = self._fallback_radiology_outline(project, artifacts) if brief.get("presentation_mode") == "radiology_case" else self._fallback_outline(project)
+        fallback = apply_consulting_template(fallback_outline if is_radiology_case else self.with_data_slides(project, fallback_outline, artifacts))
         if not self.llm.configured:
             return {**fallback, "generated_by": "fallback", "note": "DeepSeek 未配置，已使用本地大纲。"}
         research = artifacts.get("research", {})
@@ -147,6 +203,7 @@ class AgentServices:
             "uploaded_text": parsed.get("text_context", "")[:12000],
             "web_results": research.get("web_results", [])[:8],
             "citations": verified.get("citations", [])[:12],
+            "case_prepare": artifacts.get("case_prepare", {}),
         }
         prompt = f"""
 请为一个专业演示文稿生成严格 JSON。
@@ -184,7 +241,17 @@ class AgentServices:
   "narrative": "整体叙事说明"
 }}
 必须生成 {project.slide_count} 页；不要编造资料中不存在的数字或文献。
-默认使用 consulting-default 模板系统：每页只有一个主观点，普通页最多 4 个要点，双栏每栏最多 3 个要点，流程最多 5 步。
+默认使用医学教学汇报模板系统：米白底、深蓝标题带、页脚来源署名；每页只有一个主观点，普通页最多 4 个要点，双栏每栏最多 3 个要点，流程最多 5 步。
+如果 brief.presentation_mode 是 radiology_case，必须按影像科教学病例讨论组织内容，不得编造病例事实，缺失字段必须写成待补充。
+影像病例模式的具体要求：
+- 不要把“主题要求/用户指令”原文放进封面、结束页或正文；封面只写短副标题。
+- 不要把 case-index.csv 之类病例总表单独做成数据洞察页；它只作为病例索引资料使用。
+- 内容结构要贴近用户参考 PPT：封面 → 正常解剖/检查方法或定位基础 → 疾病谱/分类/分级 → 核心疾病概念 → 影像诊断框架 → 关键征象分解 → Case 1/2/3 多页展开 → 鉴别诊断 → checklist/报告建议/讨论总结。
+- 前 1/3 不要急着堆病例，必须先讲清基础、分类和读片路径；病例页用于验证前面建立的框架。
+- 至少包含诊断框架页：临床背景、部位、大小、形态、边界、密度/信号、增强、周围改变、随访变化。
+- 每个病例至少展开 2 页：①临床背景+关键图像+读片问题；②影像征象+诊断推理+鉴别诊断/病理或随访验证/教学陷阱。
+- 病例页标题必须包含 Case ID，例如 “Case-01：典型肺腺癌读片问题”；这样导出时可以匹配上传病例图片。
+- 结尾必须包含跨病例对照、影像诊断 checklist、报告书写建议和讨论问题。
 当页面讲解技术概念、系统框架、能力体系、平台架构、Agent 工作流、数据流或治理框架时，优先使用 architecture，并给出可编辑图节点和连接关系。
 当页面讲解真实场景、产品案例、人物、行业现场或具象对象时，优先使用 image_split 或 case，并给出用于检索真实图片的 image_query；不要规划 AI 生成图片。
 """
@@ -197,11 +264,15 @@ class AgentServices:
             if not slides:
                 raise ValueError("模型未返回 slides")
             return {
-                **apply_consulting_template(self.with_data_slides(project, {
+                **apply_consulting_template(({
                     "slides": slides[: project.slide_count],
                     "target_count": project.slide_count,
                     "narrative": result.get("narrative", ""),
-                }, artifacts)),
+                } if is_radiology_case else self.with_data_slides(project, {
+                    "slides": slides[: project.slide_count],
+                    "target_count": project.slide_count,
+                    "narrative": result.get("narrative", ""),
+                }, artifacts))),
                 "target_count": project.slide_count,
                 "generated_by": self.settings.deepseek_model,
                 "note": f"DeepSeek 已生成 {min(len(slides), project.slide_count)} 页大纲与逐页内容。",
@@ -257,11 +328,23 @@ class AgentServices:
         return []
 
     async def _literature_search(self, query: str) -> list[dict]:
-        try:
-            results = await CrossrefLiteratureProvider().search(query, 12)
-            return [item.__dict__ for item in results]
-        except Exception as exc:
-            return [{"provider": "Crossref", "error": self._error_text(exc), "verified": False}]
+        providers = [
+            CrossrefLiteratureProvider(),
+            SemanticScholarLiteratureProvider(self.settings.semantic_scholar_api_key),
+            OpenAlexLiteratureProvider(),
+            PubMedLiteratureProvider(),
+        ]
+        results = await asyncio.gather(*(provider.search(query, 8) for provider in providers), return_exceptions=True)
+        citations = []
+        failures = []
+        for provider, result in zip(providers, results):
+            provider_name = provider.__class__.__name__.replace("LiteratureProvider", "")
+            if isinstance(result, Exception):
+                failures.append({"provider": provider_name, "error": self._error_text(result), "verified": False})
+                continue
+            citations.extend(result)
+        unique = dedupe_citations(citations)
+        return [item.__dict__ for item in unique[:24]] + failures
 
     def _fallback_outline(self, project: Project) -> dict:
         titles = [
@@ -296,6 +379,246 @@ class AgentServices:
             target_index = 2 if len(slides) > 3 else 1
             slides[target_index] = self._architecture_slide(project, target_index + 1)
         return {"slides": slides, "target_count": project.slide_count, "narrative": "问题—证据—方案—行动"}
+
+    @staticmethod
+    def _radiology_case_checklist(topic: str) -> list[dict]:
+        roles = [
+            ("typical", "典型病例", "呈现最有代表性的影像征象，建立基础识别框架", True),
+            ("atypical", "非典型病例", "展示容易偏离常规印象的表现，训练边界判断", False),
+            ("differential", "鉴别诊断病例", "与相似疾病并列比较，强化排除思路", True),
+            ("pitfall", "误诊陷阱病例", "复盘容易误判的征象、病史或检查条件", False),
+            ("follow_up", "病理/随访验证病例", "用病理、随访或临床结局支撑最终诊断", True),
+        ]
+        return [
+            {
+                "role": role,
+                "label": label,
+                "required": required,
+                "teaching_value": value,
+                "collect": ["已脱敏关键图像", "检查方式/序列/期相", "临床背景", "影像表现", "最终诊断或验证依据"],
+                "topic_fit": topic,
+            }
+            for role, label, value, required in roles
+        ]
+
+    @staticmethod
+    def _case_cards_from_assets(assets: list[dict]) -> list[dict]:
+        cards = []
+        for index, asset in enumerate(assets, start=1):
+            text = " ".join([
+                asset.get("filename", ""),
+                asset.get("description", ""),
+                asset.get("text", ""),
+            ]).lower()
+            has_image = asset.get("content_type", "").startswith("image/") or any(token in text for token in ["ct", "mri", "mr", "超声", "影像", "图像", "增强", "平扫"])
+            has_diagnosis = any(token in text for token in ["诊断", "病理", "随访", "确诊", "diagnosis", "pathology", "follow-up", "follow up"])
+            has_clinical = any(token in text for token in ["主诉", "病史", "临床", "症状", "年龄", "男性", "女性", "male", "female"])
+            has_deidentified = any(token in text for token in ["脱敏", "匿名", "de-identified", "deidentified", "anonymized"])
+            missing = []
+            if not has_clinical:
+                missing.append("临床背景/年龄性别")
+            if not has_image:
+                missing.append("关键图像或检查方式")
+            if not has_diagnosis:
+                missing.append("最终诊断/病理/随访结果")
+            if not has_deidentified:
+                missing.append("脱敏确认")
+            role = ["typical", "differential", "pitfall", "follow_up", "atypical"][(index - 1) % 5]
+            cards.append({
+                "case_id": f"Case {index}",
+                "source_asset_id": asset.get("id", ""),
+                "source_filename": asset.get("filename", f"病例材料 {index}"),
+                "modality": AgentServices._infer_modality(text),
+                "clinical_background": "已从材料中发现临床线索" if has_clinical else "待补充",
+                "imaging_findings": "待医生确认关键影像表现",
+                "diagnosis_basis": "材料包含诊断/病理/随访线索" if has_diagnosis else "待补充",
+                "teaching_role": role,
+                "display_mode": "reveal-answer-later" if role in {"differential", "pitfall"} else "direct explanation",
+                "missing_information": missing,
+                "readiness": "ready" if not missing else "needs_info",
+            })
+        return cards
+
+    @staticmethod
+    def _infer_modality(text: str) -> str:
+        if "mri" in text or "mr" in text or "磁共振" in text:
+            return "MRI"
+        if "ct" in text:
+            return "CT"
+        if "超声" in text or "ultrasound" in text:
+            return "超声"
+        if "x线" in text or "x-ray" in text or "dr" in text:
+            return "X 线"
+        return "待补充"
+
+    @staticmethod
+    def _case_followup_questions(case_cards: list[dict]) -> list[str]:
+        questions = []
+        for card in case_cards[:5]:
+            missing = "、".join(card.get("missing_information", []))
+            if missing:
+                questions.append(f"{card['case_id']}（{card['source_filename']}）请补充：{missing}。")
+        if not questions:
+            questions.append("请确认这些病例均已脱敏，并允许用于教学展示。")
+        questions.append("是否需要按“先读片提问、后揭示答案”的方式展示关键病例？")
+        return questions[:6]
+
+    @staticmethod
+    def _radiology_storyline(topic: str, case_cards: list[dict]) -> list[dict]:
+        if not case_cards:
+            return [
+                {"section": "正常基础", "goal": "先讲清解剖、检查方法和定位语言", "case_ids": []},
+                {"section": "疾病谱与框架", "goal": "建立分类、关键征象和鉴别路径", "case_ids": []},
+                {"section": "病例验证", "goal": "补齐典型、鉴别诊断和验证病例后再生成完整病例页", "case_ids": []},
+            ]
+        return [
+            {"section": "正常基础", "goal": f"围绕 {topic} 先讲解定位、分类和影像诊断框架", "case_ids": []},
+            {"section": "病例展开", "goal": "每个病例按临床背景、关键图像、征象推理和验证依据展开", "case_ids": [card["case_id"] for card in case_cards[:4]]},
+            {"section": "鉴别总结", "goal": "用跨病例对照沉淀 checklist、报告建议和讨论问题", "case_ids": [card["case_id"] for card in case_cards if card["teaching_role"] == "follow_up"]},
+        ]
+
+    def _fallback_radiology_outline(self, project: Project, artifacts: dict) -> dict:
+        prepare = artifacts.get("case_prepare", {})
+        case_cards = prepare.get("case_cards", [])
+        base_titles = [
+            project.title,
+            "正常解剖与检查方法基础",
+            "疾病谱与分类框架",
+            "影像诊断框架与读片路径",
+            "关键征象分解",
+        ]
+        cards = case_cards[:4] or [
+            {"case_id": "Case-01", "teaching_role": "典型表现", "modality": "待补充", "missing_information": ["关键图像", "最终诊断依据"]},
+            {"case_id": "Case-02", "teaching_role": "鉴别诊断", "modality": "待补充", "missing_information": ["关键图像", "随访或病理验证"]},
+        ]
+        case_titles = []
+        for card in cards:
+            case_id = card.get("case_id", "Case")
+            role = card.get("teaching_role", "教学病例")
+            case_titles.extend([
+                f"{case_id}：{role}读片问题",
+                f"{case_id}：影像征象与诊断推理",
+            ])
+        tail_titles = ["跨病例对照与鉴别诊断", "影像诊断 checklist 与报告建议", "讨论问题与总结"]
+        titles = base_titles + case_titles + tail_titles
+        while len(titles) < project.slide_count:
+            titles.insert(-1, f"关键征象补充 {len(titles) - len(base_titles) + 1}")
+        slides = []
+        case_lookup = {}
+        for card in cards:
+            case_lookup[str(card.get("case_id", "")).lower()] = card
+        for index, title in enumerate(titles[: project.slide_count]):
+            number = index + 1
+            if index == 0:
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "cover",
+                    "layout": "cover",
+                    "bullets": [project.topic or "影像科病例驱动教学"],
+                    "key_message": "本演示以病例事实和医生确认信息为边界。",
+                }
+            elif title == "正常解剖与检查方法基础":
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "content",
+                    "layout": "image_split",
+                    "bullets": [
+                        "先明确正常解剖、检查方式和标准切面",
+                        "统一部位、层面、密度/信号和增强描述语言",
+                        "为后续病例定位和征象判断建立共同参照",
+                    ],
+                    "key_message": "像参考课件一样，先建立正常基础，再进入病变分析。",
+                }
+            elif title == "疾病谱与分类框架":
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "content",
+                    "layout": "two_column",
+                    "left_title": "常见类别",
+                    "left_bullets": ["恶性肿瘤/癌前病变", "炎症或感染性病变", "良性结节或瘢痕改变"],
+                    "right_title": "鉴别依据",
+                    "right_bullets": ["形态与边界", "密度/信号与强化", "随访变化与验证依据"],
+                    "bullets": ["先给疾病谱，再用病例逐一落地"],
+                }
+            elif title == "影像诊断框架与读片路径":
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "content",
+                    "layout": "process",
+                    "process_steps": ["临床背景", "部位与大小", "形态和边界", "密度/信号与增强", "周围改变和随访"],
+                    "bullets": ["按固定顺序读片，减少只凭单一征象下结论"],
+                    "key_message": "参考课件式的讲解重点是把诊断路径拆成可复用步骤。",
+                }
+            elif title == "关键征象分解" or title.startswith("关键征象补充"):
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "content",
+                    "layout": "evidence",
+                    "bullets": ["形态：分叶、毛刺、类圆形或浸润性生长", "边界：清楚、欠清、包膜或胸膜牵拉", "密度/信号：实性、磨玻璃、脂肪、坏死或出血", "强化与动态变化：持续、渐进、环形或无强化"],
+                    "key_message": "先讲征象含义，再把征象带入病例判断。",
+                }
+            elif title.startswith("Case"):
+                case_key = title.split("：", 1)[0].lower()
+                card = case_lookup.get(case_key, cards[0] if cards else {})
+                is_question_page = "读片问题" in title
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "case",
+                    "layout": "image_split" if is_question_page else "case",
+                    "bullets": [
+                        f"临床背景：{card.get('clinical_background', '待补充')}",
+                        f"检查方式：{card.get('modality', '待补充')}",
+                        "请先描述部位、大小、形态、边界和密度/信号",
+                    ] if is_question_page else [
+                        f"影像表现：{card.get('imaging_findings', '待补充')}",
+                        f"诊断依据：{card.get('diagnosis_basis', '待补充')}",
+                        f"待补充：{'、'.join(card.get('missing_information', [])) or '请医生确认事实'}",
+                    ],
+                    "key_message": "先读片提问，再揭示诊断推理。" if is_question_page else "用已确认事实解释诊断，不自动编造病理或随访结论。",
+                    "case_card": card,
+                }
+            elif title == "跨病例对照与鉴别诊断":
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "content",
+                    "layout": "two_column",
+                    "left_title": "支持目标诊断",
+                    "left_bullets": ["持续存在或进展", "典型形态/强化模式", "与病理或随访一致"],
+                    "right_title": "需要排除",
+                    "right_bullets": ["炎症吸收或迁移", "良性结节稳定表现", "检查条件或伪影干扰"],
+                    "bullets": ["把病例差异转化为鉴别诊断规则"],
+                    "key_message": "参考课件常用跨病例对照来收束鉴别点。",
+                }
+            elif title == "影像诊断 checklist 与报告建议":
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "summary",
+                    "layout": "summary",
+                    "bullets": ["定位与测量", "征象完整描述", "鉴别诊断排序", "建议随访/增强/病理验证"],
+                    "key_message": "报告建议要能直接服务临床下一步决策。",
+                }
+            else:
+                slide = {
+                    "number": number,
+                    "title": title,
+                    "type": "summary" if number == project.slide_count else "content",
+                    "layout": "summary" if number == project.slide_count else "evidence",
+                    "bullets": ["读片问题", "诊断推理", "报告建议", "讨论要点"][:4],
+                    "key_message": "用病例对照沉淀可复用的影像诊断思路。",
+                }
+            slide.setdefault("citation_indices", [])
+            slide.setdefault("image_query", "")
+            slide.setdefault("speaker_notes", f"本页围绕“{title}”展开，请结合已确认病例事实讲解。")
+            slides.append(slide)
+        return {"slides": slides, "target_count": project.slide_count, "narrative": "正常基础—疾病谱分类—征象框架—病例推理—鉴别总结"}
 
     @staticmethod
     def _needs_architecture_visual(project: Project) -> bool:
